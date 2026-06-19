@@ -258,6 +258,100 @@ class TifTableModel(QAbstractTableModel):
 # Channel description editor widget (comp1 combo + comp2 lineedit + Apply)
 # ---------------------------------------------------------------------------
 
+class MeasurePairsModel(QAbstractTableModel):
+    """Table model for image/mask pairs with include toggle and channel selection."""
+    
+    HEADERS = ["Include", "Image File", "Mask File", "Channel"]
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pairs = []  # list of dicts with keys: included, image_name, image_path, mask_name, mask_path, channel
+    
+    def set_pairs(self, pairs):
+        self.beginResetModel()
+        self._pairs = pairs
+        self.endResetModel()
+    
+    def get_included_pairs(self):
+        """Return list of pairs where included=True."""
+        return [p for p in self._pairs if p.get('included', False)]
+    
+    def set_all_included(self, included):
+        """Set all pairs to included or excluded."""
+        for p in self._pairs:
+            p['included'] = included
+        self.dataChanged.emit(self.index(0, 0), self.index(len(self._pairs) - 1, 0))
+    
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._pairs)
+    
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.HEADERS)
+    
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.HEADERS[section]
+        return QVariant()
+    
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._pairs):
+            return QVariant()
+        
+        pair = self._pairs[index.row()]
+        col = index.column()
+        
+        if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
+            if col == 0:
+                return ""
+            elif col == 1:
+                return pair.get('image_name', '')
+            elif col == 2:
+                return pair.get('mask_name', '')
+            elif col == 3:
+                return str(pair.get('channel', 0))
+        
+        if role == Qt.ItemDataRole.CheckStateRole and col == 0:
+            return Qt.CheckState.Checked if pair.get('included', False) else Qt.CheckState.Unchecked
+        
+        return QVariant()
+    
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not index.isValid() or index.row() >= len(self._pairs):
+            return False
+        
+        pair = self._pairs[index.row()]
+        col = index.column()
+        
+        if role == Qt.ItemDataRole.CheckStateRole and col == 0:
+            pair['included'] = (value == Qt.CheckState.Checked.value)
+            self.dataChanged.emit(index, index)
+            return True
+        
+        if role == Qt.ItemDataRole.EditRole:
+            if col == 3:  # Channel column
+                try:
+                    pair['channel'] = int(value)
+                    self.dataChanged.emit(index, index)
+                    return True
+                except ValueError:
+                    return False
+        
+        return False
+    
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        
+        if index.column() == 0:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        elif index.column() == 3:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        
+        return flags
+
+
 class ChannelDescEditor(QWidget):
     def __init__(self, table_view, model, main_win, parent=None):
         super().__init__(parent)
@@ -586,10 +680,15 @@ class CpManager(QMainWindow):
         self.filter_size_widget.setEnabled(False)
         seg_grid.addWidget(self.filter_size_widget, 2, 0, 1, 4)
 
+        # Downscale option
+        self.chk_downscale = QCheckBox("Downscale 2× (XY only)")
+        self.chk_downscale.setToolTip("Downscale input images 2-fold in X and Y before segmentation")
+        seg_grid.addWidget(self.chk_downscale, 3, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
+
         # Run segmentation button
         self.btn_run_seg = QPushButton("Run Segmentation")
         self.btn_run_seg.clicked.connect(self.run_segmentation)
-        seg_grid.addWidget(self.btn_run_seg, 3, 0, 1, 4)
+        seg_grid.addWidget(self.btn_run_seg, 4, 0, 1, 4)
 
         layout.addLayout(seg_grid)
 
@@ -1036,6 +1135,9 @@ class CpManager(QMainWindow):
         else:
             self.seg_table_win.refresh(df, seg_path)
             self.seg_table_win.raise_()
+        
+        # Also refresh measure pairs when showing segmentation table
+        self._refresh_measure_pairs()
 
     def show_metamask_table(self):
         """Show metamasks.txt in a resizable popup table."""
@@ -1217,6 +1319,7 @@ class CpManager(QMainWindow):
                     filter_type   = filter_type,
                     filter_size   = filter_size,
                     z_range       = (rec.zstrt, rec.znd),
+                    downscale     = self.chk_downscale.isChecked(),
                 )
                 new_rows.append({
                     "Filename":     rec.filename,
@@ -1277,32 +1380,33 @@ class CpManager(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # ---- Pairing: image file + channel + mask file ----
-        layout.addWidget(QLabel("<b>Image → Mask pairing</b>"))
+        # ---- Image/Mask pairs table ----
+        layout.addWidget(QLabel("<b>Image → Mask pairs</b>"))
+        
+        # Create table for pairs
+        self.tbl_measure = QTableView()
+        self.tbl_measure.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl_measure.horizontalHeader().setStretchLastSection(True)
+        self.tbl_measure.setAlternatingRowColors(True)
+        layout.addWidget(self.tbl_measure)
 
-        pair_grid = QGridLayout()
-        pair_grid.addWidget(QLabel("Image file:"), 0, 0)
-        self.combo_msr_img = QComboBox()
-        self.combo_msr_img.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        pair_grid.addWidget(self.combo_msr_img, 0, 1)
+        # Initialize model
+        self.measure_pairs_model = MeasurePairsModel(self)
+        self.tbl_measure.setModel(self.measure_pairs_model)
 
-        pair_grid.addWidget(QLabel("Channel index:"), 1, 0)
-        self.spin_msr_ch = QSpinBox()
-        self.spin_msr_ch.setRange(0, 15)
-        self.spin_msr_ch.setValue(0)
-        self.spin_msr_ch.setFixedWidth(60)
-        pair_grid.addWidget(self.spin_msr_ch, 1, 1, Qt.AlignmentFlag.AlignLeft)
-
-        pair_grid.addWidget(QLabel("Mask file:"), 2, 0)
-        self.combo_msr_mask = QComboBox()
-        self.combo_msr_mask.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        pair_grid.addWidget(self.combo_msr_mask, 2, 1)
-
-        btn_refresh = QPushButton("Refresh file lists")
-        btn_refresh.clicked.connect(self._refresh_measure_combos)
-        pair_grid.addWidget(btn_refresh, 3, 0, 1, 2)
-        pair_grid.setColumnStretch(1, 1)
-        layout.addLayout(pair_grid)
+        # ---- Buttons ----
+        btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("Refresh pairs")
+        btn_refresh.clicked.connect(self._refresh_measure_pairs)
+        btn_row.addWidget(btn_refresh)
+        btn_sel_all = QPushButton("Select all")
+        btn_sel_all.clicked.connect(lambda: self._set_all_pairs(True))
+        btn_row.addWidget(btn_sel_all)
+        btn_sel_none = QPushButton("Select none")
+        btn_sel_none.clicked.connect(lambda: self._set_all_pairs(False))
+        btn_row.addWidget(btn_sel_none)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
         # ---- Metrics ----
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -1333,19 +1437,54 @@ class CpManager(QMainWindow):
         layout.addStretch()
         return widget
 
-    def _refresh_measure_combos(self):
+    def _refresh_measure_pairs(self):
+        """Populate the measure pairs table from data manager and segmentation results."""
+        pairs = []
+        
+        # Get image files from data manager (included records)
+        img_files = [(r.filename, r.path) for r in self.model.records if r.included]
+        
+        # Get mask files from seg_results and metamask_results
+        mask_files = set()
         out_dir = self.output_folder
-        self.combo_msr_img.clear()
-        self.combo_msr_mask.clear()
-        for r in self.model.records:
-            if r.included:
-                self.combo_msr_img.addItem(r.filename, userData=r.path)
-        masks_dir    = os.path.join(out_dir, "Masks") if out_dir else ""
+        masks_dir = os.path.join(out_dir, "Masks") if out_dir else ""
         metamask_dir = os.path.join(masks_dir, "Metamask") if masks_dir else ""
+        
         for d in (masks_dir, metamask_dir):
             if d and os.path.isdir(d):
                 for f in sorted(glob.glob(os.path.join(d, "*.tif"))):
-                    self.combo_msr_mask.addItem(os.path.basename(f), userData=f)
+                    mask_files.add((os.path.basename(f), f))
+        
+        # Create pairs (match by filename similarity if possible, otherwise all combinations)
+        if img_files and mask_files:
+            for img_name, img_path in img_files:
+                # Find best matching mask (same base name)
+                base = img_name.replace('.tif', '').replace('.tiff', '')
+                best_mask = None
+                for mask_name, mask_path in mask_files:
+                    mask_base = mask_name.replace('_masks.tif', '').replace('_metamask.tif', '')
+                    if base in mask_base or mask_base in base:
+                        best_mask = (mask_name, mask_path)
+                        break
+                # If no match found, use first mask
+                if best_mask is None:
+                    best_mask = list(mask_files)[0]
+                
+                pairs.append({
+                    'included': True,
+                    'image_name': img_name,
+                    'image_path': img_path,
+                    'mask_name': best_mask[0],
+                    'mask_path': best_mask[1],
+                    'channel': 0,
+                })
+        
+        self.measure_pairs_model.set_pairs(pairs)
+        self.lbl_msr_status.setText(f"Loaded {len(pairs)} image/mask pair(s)")
+
+    def _set_all_pairs(self, included):
+        """Set all pairs to included or excluded."""
+        self.measure_pairs_model.set_all_included(included)
 
     def run_measurements(self):
         from cp_measure import measure_file
@@ -1353,33 +1492,61 @@ class CpManager(QMainWindow):
         if not out_dir:
             QMessageBox.warning(self, "No output folder", "Please set an output folder first.")
             return
-        img_path  = self.combo_msr_img.currentData()
-        mask_path = self.combo_msr_mask.currentData()
-        if not img_path or not mask_path:
-            QMessageBox.warning(self, "Missing selection",
-                                "Please select both an image file and a mask file.\n"
-                                "Use 'Refresh file lists' if the combos are empty.")
+        
+        # Get included pairs
+        pairs = self.measure_pairs_model.get_included_pairs()
+        if not pairs:
+            QMessageBox.warning(self, "No pairs selected", 
+                "No image/mask pairs are selected for measurement.\n"
+                "Click 'Refresh pairs' to load pairs, then check the 'Include' column.")
             return
+        
         metrics = [m for m, cb in self.chk_metrics.items() if cb.isChecked()]
         if not metrics:
             QMessageBox.warning(self, "No metrics", "Select at least one metric.")
             return
-        ch = self.spin_msr_ch.value()
+        
         msr_dir = os.path.join(out_dir, "Measurements")
-        try:
-            out_path, df = measure_file(
-                img_path, mask_path,
-                channel_idx   = ch,
-                metrics       = metrics,
-                output_folder = msr_dir,
-            )
-            self.measure_df = pd.concat([self.measure_df, df], ignore_index=True)
-            self.lbl_msr_status.setText(f"{len(df)} labels measured → {out_path}")
-            self._populate_plot_combos()
-            QMessageBox.information(self, "Done",
-                f"{len(df)} labels measured.\nSaved to:\n{out_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+        os.makedirs(msr_dir, exist_ok=True)
+        
+        total_files = 0
+        total_labels = 0
+        errors = []
+        
+        for pair in pairs:
+            img_path = pair['image_path']
+            mask_path = pair['mask_path']
+            ch = pair['channel']
+            
+            try:
+                out_path, df = measure_file(
+                    img_path, mask_path,
+                    channel_idx   = ch,
+                    metrics       = metrics,
+                    output_folder = msr_dir,
+                )
+                self.measure_df = pd.concat([self.measure_df, df], ignore_index=True)
+                total_files += 1
+                total_labels += len(df)
+                print(f"[measure] {pair['image_name']} + {pair['mask_name']}: {len(df)} labels")
+            except Exception as e:
+                err_msg = f"{pair['image_name']}: {str(e)}"
+                errors.append(err_msg)
+                print(f"[measure] ERROR: {err_msg}")
+        
+        # Update status
+        status_msg = f"Measured {total_labels} labels in {total_files} file(s)"
+        if errors:
+            status_msg += f", {len(errors)} error(s)"
+        self.lbl_msr_status.setText(status_msg)
+        
+        # Refresh plot combos and show summary
+        self._populate_plot_combos()
+        if errors:
+            QMessageBox.warning(self, "Completed with errors", 
+                f"{status_msg}\n\nErrors:\n" + "\n".join(errors[:5]))
+        else:
+            QMessageBox.information(self, "Done", f"{status_msg}\nResults in: {msr_dir}")
 
     # ------------------------------------------------------------------
     # Plot tab

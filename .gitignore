@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environment
+.venv*/
+venv*/
+
+# Jupyter notebooks
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+test_*.py
+cp_tst*.py
+cp_cellnuc_test.py
+cp_cellnuc_view.py
+cp_view.py
+tiffSegment.py
+
+# Documentation
+Instructions.txt
+
+# Cache
+*.pkl
+*.cache

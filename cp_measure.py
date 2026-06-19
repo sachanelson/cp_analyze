@@ -86,7 +86,15 @@ def measure_file(img_path, mask_path, channel_idx,
     if img_base  is None: img_base  = os.path.splitext(os.path.basename(img_path))[0]
     if mask_base is None: mask_base = os.path.splitext(os.path.basename(mask_path))[0]
 
-    img  = tf.imread(img_path)
+    # Check for rescaled image first
+    rescaled_dir = os.path.join(os.path.dirname(os.path.dirname(mask_path)), "Rescaled")
+    rescaled_path = os.path.join(rescaled_dir, f"{img_base}_rescaled.tif")
+    if os.path.exists(rescaled_path):
+        img = tf.imread(rescaled_path)
+        print(f"[cp_measure] Using rescaled image: {os.path.basename(rescaled_path)}")
+    else:
+        img = tf.imread(img_path)
+    
     mask = tf.imread(mask_path).astype(np.int32)
 
     if img.ndim == 4:
@@ -104,7 +112,8 @@ def measure_file(img_path, mask_path, channel_idx,
 
     if img_zyx.shape != mask.shape:
         raise ValueError(
-            f"Image shape {img_zyx.shape} does not match mask shape {mask.shape}"
+            f"Image shape {img_zyx.shape} does not match mask shape {mask.shape}. "
+            f"Ensure you're using matching rescaled/original files."
         )
 
     df = measure_labels(img_zyx, mask, metrics)

@@ -53,7 +53,7 @@ def _get_model():
     global _model
     if _model is None:
         logger_setup()
-        _model = models.CellposeModel(gpu=True)
+        _model = models.CellposeModel(gpu=True, resample=True)
     return _model
 
 
@@ -70,7 +70,7 @@ def _apply_filter(vol_zyx, filter_type, filter_size):
 
 def segment(img, channel_spec, base_name, output_folder,
             filter_type="None", filter_size=(2, 2, 2),
-            z_range=None):
+            z_range=None, downscale=False):
     """
     Run Cellpose segmentation on a slice of a multichannel 3-D image.
 
@@ -129,13 +129,41 @@ def segment(img, channel_spec, base_name, output_folder,
         ch_desc  = "ch3=S2"
 
     # ----------------------------------------------------------------
-    # 3. Apply filter to signal channel only
+    # 3. Apply optional downscaling (XY only)
+    # ----------------------------------------------------------------
+    if downscale:
+        from skimage.transform import resize
+        # Downscale 2× in XY only using order=1 (bilinear) for smoothness
+        orig_shape = cell_vol.shape
+        new_shape = (orig_shape[0], orig_shape[1]//2, orig_shape[2]//2)
+        cell_vol = resize(cell_vol, new_shape, order=1, preserve_range=True, anti_aliasing=True).astype(cell_vol.dtype)
+        if nuc_vol is not None:
+            nuc_vol = resize(nuc_vol, new_shape, order=1, preserve_range=True, anti_aliasing=True).astype(nuc_vol.dtype)
+        print(f"[cp_segment] Downscaled from {orig_shape} to {new_shape}")
+        
+        # Save rescaled image to Rescaled directory
+        rescaled_dir = os.path.join(os.path.dirname(output_folder), "Rescaled")
+        os.makedirs(rescaled_dir, exist_ok=True)
+        rescaled_path = os.path.join(rescaled_dir, f"{base_name}_rescaled.tif")
+        
+        # Save the rescaled image (all channels if possible)
+        if nuc_vol is not None:
+            # Save both channels as rescaled 2-channel image
+            rescaled_img = np.stack([cell_vol, nuc_vol], axis=1)  # (Z, 2, Y, X)
+            tf.imwrite(rescaled_path, rescaled_img, metadata={"axes": "ZCYX"})
+        else:
+            # Save single channel
+            tf.imwrite(rescaled_path, cell_vol, metadata={"axes": "ZYX"})
+        print(f"[cp_segment] Saved rescaled image: {rescaled_path}")
+
+    # ----------------------------------------------------------------
+    # 4. Apply filter to signal channel only
     # ----------------------------------------------------------------
     if filter_type != "None":
         cell_vol = _apply_filter(cell_vol, filter_type, filter_size)
 
     # ----------------------------------------------------------------
-    # 4. Build input array for Cellpose
+    # 5. Build input array for Cellpose
     #    For CN: send 2-ch stack so cellpose can use nuclear guidance.
     #    For all others: send the single extracted channel only.
     # ----------------------------------------------------------------
@@ -147,21 +175,23 @@ def segment(img, channel_spec, base_name, output_folder,
         channel_axis = None
 
     # ----------------------------------------------------------------
-    # 5. Diagnostics
+    # 6. Diagnostics
     # ----------------------------------------------------------------
     print(f"[cp_segment] Segmenting '{base_name}'")
     print(f"  spec      : {channel_spec}  ({_SPEC_DESC[channel_spec]})")
     print(f"  user spec : {ch_desc}")
     print(f"  filter    : {filter_type}")
     print(f"  z range   : {z_start}–{z_end}")
+    print(f"  downscale : {downscale}")
+    print(f"  resample  : True")
     print(f"  img shape : {img.shape}  (n_ch={n_ch})")
     print(f"  cp input  : shape={cp_input.shape}, dtype={cp_input.dtype}, "
           f"channel_axis={channel_axis}")
 
     # ----------------------------------------------------------------
-    # 6. Run Cellpose
+    # 7. Run Cellpose
     # ----------------------------------------------------------------
-    model = _get_model()
+    model = _get_model()  # Always use resample=True
     kwargs = dict(
         z_axis=0,
         do_3D=False,
@@ -177,7 +207,23 @@ def segment(img, channel_spec, base_name, output_folder,
     print(f"[cp_segment] Done — {n_masks} masks found")
 
     # ----------------------------------------------------------------
-    # 6. Save mask file to output_folder/Masks/
+    # 8. Upscale masks to appropriate size
+    # ----------------------------------------------------------------
+    if downscale:
+        # Upscale to downsampled size
+        target_shape = (orig_shape[0], orig_shape[1]//2, orig_shape[2]//2)
+        from skimage.transform import resize
+        masks = resize(masks, target_shape, order=0, preserve_range=True, anti_aliasing=False).astype(np.int32)
+        print(f"[cp_segment] Upscaled masks to downsampled size: {target_shape}")
+    else:
+        # Upscale to original size
+        target_shape = (img.shape[0], img.shape[2], img.shape[3])  # Z, Y, X of original
+        from skimage.transform import resize
+        masks = resize(masks, target_shape, order=0, preserve_range=True, anti_aliasing=False).astype(np.int32)
+        print(f"[cp_segment] Upscaled masks to original size: {target_shape}")
+
+    # ----------------------------------------------------------------
+    # 9. Save mask file to output_folder/Masks/
     # ----------------------------------------------------------------
     masks_dir = os.path.join(output_folder, "Masks")
     os.makedirs(masks_dir, exist_ok=True)
@@ -185,6 +231,8 @@ def segment(img, channel_spec, base_name, output_folder,
     tag = f"{channel_spec}_z{z_start}-{z_end}"
     if filter_type != "None":
         tag += f"_{filter_type.lower()}"
+    if downscale:
+        tag += "_downscale2x"
     mask_name = f"{base_name}_{tag}_masks.tif"
     mask_path = os.path.join(masks_dir, mask_name)
 
